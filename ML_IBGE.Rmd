@@ -1,0 +1,525 @@
+---
+title: "Machine Learning no IBGE"
+subtitle: Regressão (Tidyverse Style)
+author: "Lucas Magalhães E Ferreira"
+date: "31 de agosto de 2019"
+output: 
+  html_document:
+  github_document:
+    highlight: espresso
+    theme: journal
+---
+
+## Revendo o Dataset
+
+Olá! Seja bem vindo mais uma vez ao dataset de nascimentos e casamentos do IBGE. A base de dados é composta de **4536 observações** e **6 variáveis (estado, ano, faixa etária da mulher, quantidade de nascimentos de bebês do sexo masculino, quantidade de nascimentos de bebês do sexo feminino e quantidade de casamentos**. A *"key"* de cada observação é um conjunto de estado, ano da observação e faixa etária da mulher que casou naquele período ou faixa etária da mãe que teve bebês naquele período.
+Vamos fazer uma breve revisão, antes de partir para o modelo preditivo.
+
+
+```{r,echo =  TRUE,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(readxl)
+casamentos_nascimentosbr<-read_xlsx("C:\\Users\\lferreira\\Downloads\\live university\\Projetos\\casamentos_nascimentosbr.xlsx")
+
+glimpse(casamentos_nascimentosbr)
+
+summary(casamentos_nascimentosbr)
+
+
+```
+
+Lembrando que o período das observações vai entre 2003 a 2016. Essa é uma base livre de NA's!
+
+Vamos nessa análise **elaborar um modelo preditivo que possa para cada estado prever o número de nascimentos, dependendo de variáveis, como faixa etária da mulher e quantidade de casamentos.**
+
+Vamos criar dois modelos de aprendizagem supervisionada a _**Regressão Múltipla**_ e _**Random Forest**_ e decidir qual modelo tem melhor capacidade para prever a quantidade de nascimentos, através de uma das mais famosas medidas de avaliação de desempenho, o **SMAPE!(Symmetric Mean Absolute Percentage Error)**.
+
+Para simplificar, vamos agrupar a quantidade de nascimentos de homens e mulheres em uma variável só!
+
+```{r,echo=TRUE}
+casamentos_nascimentosbr_ml<-casamentos_nascimentosbr%>%
+  group_by(estado,classe,ano)%>%
+  summarise(nasc_masc=sum(nasc_masc),nasc_fem=sum(nasc_fem),qtd_casamentos=sum(qtd_casamentos))%>%
+  mutate(qtd_nascimentos=nasc_masc+nasc_fem)
+#Arrumando as variáveis
+ casamentos_nascimentosbr_ml<-casamentos_nascimentosbr_ml[,c(1,2,3,6,7)]
+ casamentos_nascimentosbr_ml$estado<-as.factor(casamentos_nascimentosbr_ml$estado)
+ casamentos_nascimentosbr_ml$ano<-as.integer(casamentos_nascimentosbr_ml$ano)
+  #trocando os valores de classe para numero ordinal
+ casamentos_nascimentosbr_ml$classe<-factor(casamentos_nascimentosbr_ml$classe,levels=c(
+    "15 a 19 anos","20 a 24 anos","25 a 29 anos","30 a 34 anos",
+   "35 a 39 anos","40 a 44 anos","Menos de 15 anos","45 a 49 anos","50 anos ou mais"
+ ))
+
+
+```
+
+Não sei se repararam, mas fiz algo interessante, já que a faixa "menos de 15 anos" possui  índice de correlação  parecido com as faixas acima de 45 anos, ou seja, sem muito padrão. Para explicar a variável target (Visto em [EDA IBGE](https://rpubs.com/magal1337/EDAIBGE)), **coloquei uma próxima da outra no argumento** `levels`**.** **Isso vai ser crucial para o nosso modelo**.
+
+## Correlação entre quantidade de casamentos e quantidade de nascimentos
+```{r, echo = TRUE,fig.align='center',fig.height= 8,fig.width= 8}
+casamentos_nascimentosbr_ml%>%
+    ggplot(aes(x=qtd_casamentos,y=qtd_nascimentos,col=estado))+
+    geom_point()+
+    geom_smooth(method ="lm",se=FALSE)+
+    labs(title = "Correlação entre casamentos e nascimentos",subtitle = "Observações em estado,ano e classe",
+         caption = "Fonte: IBGE - Estatísticas do Registro Civil (2003-2016)",x="Qtd de Casamentos",
+         y="Qtd de Nascimentos")+
+    scale_y_continuous(label=scales::comma)+
+    scale_x_continuous(label=scales::comma)+
+    theme_light()
+
+library(GGally)
+
+casamentos_nascimentosbr_ml%>%
+  ggpairs(3:5)
+
+```
+
+Aparentemente sem multicolinearidade entre as variáveis.
+
+Vamos agrupar o dataset em estado. Gosto muito quando vou elaborar vários modelos de uma vez só  usar o purrr e o tidyr package! Principalmente por duas grandes e maravilhosas funções, a `nest()` e a `map()` para trabalhar com listas!
+
+Vamos agrupar e dar uma olhada na correlação entre quantidade de nascimentos e casamentos para cada estado?
+
+```{r,echo=TRUE,fig.align='center',fig.height= 6,fig.width= 8}
+library(purrr)
+
+casamentos_nascimentosbr_ml_nest<-casamentos_nascimentosbr_ml%>%
+  group_by(estado)%>%nest()
+
+casamentos_nascimentosbr_ml_nest%>%
+  mutate(cor_pearson = map_dbl(.x=data,.f= ~cor(.$qtd_casamentos,.$qtd_nascimentos)))%>%
+  ggplot(aes(y=cor_pearson))+
+  geom_boxplot()+
+  labs(x="",y="Correlação de Pearson",title = "BoxPlot - Correlação de Pearson",
+       caption = "Fonte: IBGE - Estatísticas do Registro Civil (2003-2016)")+
+  theme_dark()+
+  theme(
+    axis.text.x = element_blank()
+  )
+```
+
+Uau! Que poder! Correlação excelente de um modo geral, mas vemos um outlier em nosso boxplot. Qual estado será? Vamos descobrir.
+
+```{r,echo=TRUE,fig.align='center',fig.height= 6,fig.width= 8}
+casamentos_nascimentosbr_ml_nest%>%
+  mutate(cor_pearson = map_dbl(.x=data,.f= ~cor(.$qtd_casamentos,.$qtd_nascimentos)))%>%
+  filter(cor_pearson<.8)
+```
+
+Ainda assim uma correlação de 0.71 é excelente! Bem, vamos dar início à modelagem.
+
+##Modelando com Regressão Linear Múltipla
+```{r,echo=TRUE,fig.align='center',fig.height= 6,fig.width= 8}
+
+library(rsample) #Criando a partição
+set.seed(42) 
+casamentos_nascimentosbr_ml_split<-casamentos_nascimentosbr_ml_nest%>%
+  mutate(split = map(.x=data,.f=~initial_split(.x,prop=0.75))) #vamos fazer uma separação entre treinamento e teste com uma relação 75/25
+
+casamentos_nascimentosbr_ml_split<-casamentos_nascimentosbr_ml_split%>%
+  mutate(train_CV = map(.x=split,.f=~training(.x)),test = map(.x=split,.f=~testing(.x)))
+
+head(casamentos_nascimentosbr_ml_split)
+```
+
+Beleza, agora na amostra de treinamento __*train_CV*__ vamos fazer uma validação cruzada criando 5 partições e para cada partição vamos fazer a mesma divisão proporcional entre treinamento e teste.
+
+```{r,echo=TRUE,fig.align='center',fig.height= 6,fig.width= 8}
+casamentos_nascimentosbr_ml_split<-casamentos_nascimentosbr_ml_split%>%
+  mutate(CV_split = map(.x=train_CV,.f=~vfold_cv(.x,v=5)))
+
+#vamos agora dar unnest e trabalhar com um dataset da validação cruzada a parte para facilitar
+# a modelagem
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_split%>%
+ unnest(CV_split)
+head(casamentos_nascimentosbr_ml_CV)
+
+#criando uma amostra de treino e uma de teste para cada partição da validação cruzada
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(
+    train = map(splits, ~training(.x)), 
+    validate = map(splits, ~testing(.x))
+  )
+
+head(casamentos_nascimentosbr_ml_CV)
+
+```
+
+Beleza, tudo certo. Partições criadas, amostras de treinamento e testes prontos. Agora, vamos para a criação do modelo de regressão!
+
+```{r,echo=TRUE}
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(model = map(.x=train,.f=~lm(qtd_nascimentos~.,data=.x)))
+head(casamentos_nascimentosbr_ml_CV)
+```
+
+Vamos ver como ficou nosso R² ajustado, para cada modelo:
+
+```{r,echo=TRUE}
+library(broom)
+casamentos_nascimentosbr_ml_CV%>%
+  mutate(
+    rsquad = map_dbl(.x=model,.f=~glance(.x)[["adj.r.squared"]])
+  )%>%
+  ggplot(aes(y=rsquad))+
+  geom_boxplot()+
+  labs(x="",y="R² Ajustado",title = "BoxPlot - R² Ajustado distribuição por modelo",
+       caption = "Fonte: IBGE - Estatísticas do Registro Civil (2003-2016)")+
+  theme_dark()+
+  theme(
+    axis.text.x = element_blank()
+  )
+
+```
+
+Assombroso! Parece que as variáveis do dataset estão conseguindo explicar de forma excelente a variação no fator quantidade de nascimentos. Mas será que o modelo vai ser capaz de prever bem nas amostras de teste da validação cruzada?
+
+Mas antes disso, será que podemos melhorar ainda mais o nosso modelo? Gosto sempre quando trabalho com regressão, pois tento aperfeiçoar o modelo, minimizando o valor do critério de Akaike com a `stepAIC()` função do MASS package.
+
+
+```{r,echo=TRUE}
+library(MASS)
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(model_otimo = map(.x=train,.f=~(lm(qtd_nascimentos~.,data=.x)%>%
+  stepAIC(trace=0))
+  ))
+
+casamentos_nascimentosbr_ml_CV%>%
+  mutate(
+    rsquad = map_dbl(.x=model_otimo,.f=~glance(.x)[["adj.r.squared"]])
+  )%>%
+  ggplot(aes(y=rsquad))+
+  geom_boxplot()+
+  labs(x="",y="R² Ajustado",title = "BoxPlot - R² Ajustado distribuição por modelo otimo",
+       caption = "Fonte: IBGE - Estatísticas do Registro Civil (2003-2016)")+
+  theme_dark()+
+  theme(
+    axis.text.x = element_blank()
+  )
+
+```
+
+Como o modelo já tinha um nível muito bom, não tivemos uma diferença significativa entre eles.
+
+Mas vamos seguir com ambos os modelos para validação com o SMAPE!
+
+
+```{r,echo=TRUE}
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(
+    
+    validate_actual = map(validate, ~.x$qtd_nascimentos),
+    
+    validate_predicted = map2(.x = model_otimo, .y = validate, ~predict(.x, .y))
+    
+  )
+
+head(casamentos_nascimentosbr_ml_CV)
+
+library(Metrics)
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(validate_smape = map2_dbl(
+    .x=validate_actual,.y= validate_predicted,.f= ~smape(actual = .x, predicted = .y)))
+
+casamentos_nascimentosbr_SMAPE<-casamentos_nascimentosbr_ml_CV%>%
+  group_by(estado)%>%
+  summarise(SMAPE = mean(validate_smape))
+
+library(knitr)
+
+kable(casamentos_nascimentosbr_SMAPE)
+
+```
+
+Ops! Tivemos um overfitting, parece que na amostra de treinamento, os fatores conseguem explicar muito bem a variação do fator quantidade de nascimentos, mas para previsão fora da amostra o desempenho ficou muito abaixo do esperado! 
+
+Vamos tentar então simplificar o modelo, vamos usar somente as variaveis qtd_casamentos e classe, como variáveis explicativas dessa vez!
+
+```{r,echo=TRUE}
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(model2 = map(.x=train,.f=~lm(qtd_nascimentos~qtd_casamentos+classe,data=.x)))
+
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(
+    
+    
+    
+    validate_predicted2 = map2(.x = model2, .y = validate, ~predict(.x, .y))
+    
+  )
+
+
+casamentos_nascimentosbr_ml_CV<-casamentos_nascimentosbr_ml_CV%>%
+  mutate(validate_smape2 = map2_dbl(
+    .x=validate_actual,.y= validate_predicted2,.f= ~smape(actual = .x, predicted = .y)))
+
+casamentos_nascimentosbr_SMAPE2<-casamentos_nascimentosbr_ml_CV%>%
+  group_by(estado)%>%
+  summarise(SMAPE2 = mean(validate_smape2))
+
+kable(casamentos_nascimentosbr_SMAPE2)
+
+analise_SMAPE<-full_join(casamentos_nascimentosbr_SMAPE,casamentos_nascimentosbr_SMAPE2,by="estado")
+
+analise_SMAPE%>%gather(Modelo,Valor,2:3)%>%
+  ggplot(aes(x=estado,y=Valor,fill=Modelo))+
+  geom_col(position = "dodge")+
+  geom_hline(yintercept = .2,linetype = "dashed",col = "black",size=1)+
+  coord_flip()
+```
+
+Parece que o modelo 2 mais simples, teve um efeito preditivo melhor.
+
+Vamos finalizar fazendo calculo na amostra de teste que separamos no inicio da modelagem.
+
+
+```{r,echo=TRUE}
+
+casamentos_nascimentosbr_ml_reg<-full_join(
+ casamentos_nascimentosbr_ml_split,
+  analise_SMAPE,
+  by="estado")
+
+#facilitar a leitura
+casamentos_nascimentosbr_ml_reg<-casamentos_nascimentosbr_ml_reg[,c(1,4,5,7,8)]
+ 
+head(casamentos_nascimentosbr_ml_reg)
+
+#criando o modelo melhor para cada estado
+casamentos_nascimentosbr_ml_reg<-casamentos_nascimentosbr_ml_reg%>%
+  mutate(best_model = if_else(
+    
+  SMAPE<SMAPE2,"MODEL1","MODEL2"  
+    
+  ))
+
+
+casamentos_nascimentosbr_ml_reg<-casamentos_nascimentosbr_ml_reg%>%
+  mutate(model =if_else(best_model=="MODEL1",
+   map(.x=train_CV,.f=~(lm(
+   qtd_nascimentos~.,data=.x)%>%      
+   stepAIC(trace=0))),
+   map(.x=train_CV,
+  .f=~lm(qtd_nascimentos~qtd_casamentos+classe,data=.x))))
+                        
+casamentos_nascimentosbr_ml_reg<-casamentos_nascimentosbr_ml_reg%>%
+  mutate(
+    
+    validate_actual = map(test, ~.x$qtd_nascimentos),
+    
+    validate_predicted = map2(.x = model, .y = test, ~predict(.x, .y))
+    
+  )                        
+                        
+                        
+casamentos_nascimentosbr_ml_reg<-casamentos_nascimentosbr_ml_reg%>%
+  mutate(SMAPE_final = map2_dbl(
+    .x=validate_actual,.y= validate_predicted,.f= ~smape(actual = .x, predicted = .y)))                       
+                        
+                        
+ ggplot(casamentos_nascimentosbr_ml_reg,aes(x=estado,y=SMAPE_final))+
+   geom_col()+
+   geom_hline(yintercept = .2,linetype="dashed",col="red")+
+   coord_flip()
+                        
+  casamentos_nascimentosbr_ml_reg%>%
+   count(SMAPE_final<=.2)%>%
+    kable()
+```
+
+Bem, amenizamos um pouco a situação, mas ainda temos 23 modelos com um SMAPE maior do que 20%. Inaceitável!
+
+Será que conseguimos algo melhor com o Random Forest?
+
+## Modelando com Random Forest (Floresta Aleatória)
+
+Vamos manter a mesma partição da validação cruzada usada na regressão.
+No nosso modelo, para facilitar o processamento vamos deixar o número de árvores em 100. Acredito que já  seja um valor razoável para criação de um bom modelo. Para o parâmetro mtry, vamos inserir todas as possibilidades de um a três fatores, usando a função `crossing()` assim vamos saber qual o parâmetro mtry terá o melhor desempenho.
+
+```{r,echo=TRUE}
+
+
+library(ranger)
+  casamentos_nascimentosbr_ml_CV2<-casamentos_nascimentosbr_ml_CV[,1:5]
+  
+  casamentos_nascimentosbr_ml_tune<-casamentos_nascimentosbr_ml_CV2%>%
+    crossing(mtry=1:3)
+
+  #random forest para cada combinação de estado, fold e mtry
+  casamentos_nascimentosbr_ml_tune<-casamentos_nascimentosbr_ml_tune%>%
+    mutate(
+      model = map2(.x=train,.y=mtry,.f= ~ranger(formula=qtd_nascimentos~.,data= .x,
+      num.trees=100,seed = 42,mtry = .y))
+   
+    )
+  
+  casamentos_nascimentosbr_ml_tune<-casamentos_nascimentosbr_ml_tune%>%
+    mutate(
+      validate_predicted = map2(.x = model, .y = validate, ~predict(.x, .y)$predictions))
+  
+  casamentos_nascimentosbr_ml_tune<-casamentos_nascimentosbr_ml_tune%>%
+    mutate(
+      validate_actual = map(.x=validate,.f= ~.x$qtd_nascimentos))
+ 
+  casamentos_nascimentosbr_ml_tune<-casamentos_nascimentosbr_ml_tune%>%
+    mutate(validate_smape = map2_dbl(.x=validate_actual,
+   .y=validate_predicted, .f= ~smape(actual = .x, predicted = .y)))
+  
+  casamentos_nascimentosbr_ml_rf<-casamentos_nascimentosbr_ml_tune%>%
+    group_by(estado,mtry)%>%
+    summarise(SMAPE = mean(validate_smape))
+  
+  
+  kable(casamentos_nascimentosbr_ml_rf)
+  
+   casamentos_nascimentosbr_ml_rf2<-casamentos_nascimentosbr_ml_tune%>%
+    group_by(mtry)%>%
+    summarise(SMAPE = mean(validate_smape))
+   
+   kable(casamentos_nascimentosbr_ml_rf2)
+
+
+```
+
+Hum, parece que o parâmetro `mtry(3)` foi o melhor entre os demais. Vamos continuar com a amostra de teste final.
+
+```{r,echo=TRUE}
+
+casamentos_nascimentos_br_rf<-casamentos_nascimentosbr_ml_split[,c(1,4,5)]
+  
+  casamentos_nascimentos_br_rf<-casamentos_nascimentos_br_rf%>%
+   mutate(
+     
+     model = map(.x=train_CV,.f= ~ranger(formula=qtd_nascimentos~.,data= .x,
+                                               num.trees=100,seed = 42,mtry = 3))
+     
+   )
+       
+  casamentos_nascimentos_br_rf<-casamentos_nascimentos_br_rf%>%
+    mutate(
+      validate_predicted = map2(.x = model, .y = test, ~predict(.x, .y)$predictions))
+  casamentos_nascimentos_br_rf<-casamentos_nascimentos_br_rf%>%
+    mutate(
+      validate_actual = map(.x=test,.f= ~.x$qtd_nascimentos))     
+ 
+    
+  casamentos_nascimentos_br_rf<-casamentos_nascimentos_br_rf%>%
+    mutate(validate_smape = map2_dbl(.x=validate_actual,
+                                    .y=validate_predicted, .f= ~smape(actual = .x, predicted = .y)))
+
+#comparando os MAPE de Regressão multipla e random forest
+  
+  smape_ml_models<-full_join(casamentos_nascimentosbr_ml_reg[,c(1,10)],
+  casamentos_nascimentos_br_rf[,c(1,7)],by="estado")
+    colnames(smape_ml_models)<-c("estado","smape_regressao","smape_random_forest")
+  smape_ml_models2<-smape_ml_models%>%
+    gather(modelo,smape,2:3)
+  ggplot(smape_ml_models2,aes(x=estado,y=smape,fill=modelo))+
+    geom_col(position = "dodge")+
+    geom_hline(yintercept = .2,linetype="dashed",col="red",size=1)+
+    coord_flip()
+  
+  kable(smape_ml_models)
+  
+  smape_ml_models%>%
+    count(smape_regressao<smape_random_forest)
+  
+  smape_ml_models2%>%
+    filter(modelo == "smape_regressao")%>%
+    count(smape<=.2)
+  
+  smape_ml_models2%>%
+    filter(modelo == "smape_random_forest")%>%
+    count(smape<=.2)
+  
+  mean(smape_ml_models$smape_random_forest)
+  
+```
+
+Excelente, exceto pelo estado de Roraima, o modelo de Random Forest foi superior! Mesmo assim a diferença do estado de Roraima foi muito pequena e podemos dizer que tivemos para todos os estados com o modelo de Random Forest um SMAPE menor do que 21% com média de 11,7%!
+
+Como fizemos uma análise exploratória de dados no artigo anterior, descobrimos que para faixas etárias "menos de 15 anos" e para classes acima de 45 anos possuem comportamento muito parecido. Não temos tanto padrão só com número de casamentos, o que faz todo sentido, correto? Precisaríamos de mais variáveis para tentar explicar o número de nascimentos para essas classes. Poderíamos até agrupar essas classes em uma só, para nossa modelagem (ex: Faixas etárias fora do intervalo 15-44). Mas achei melhor deixá-las próximas no argumento `levels()`. Sem esse conhecimento de "ordem", se colocássemos o argumento classe, somente com ordem de idade, obteríamos um modelo muito pior, com média do smape em torno de 50%!
+Por este motivo, sempre acho válido analisar bem o dataset antes para descobrir insights valiosos para modelagem!
+
+
+##Final: Previsão para 2017
+
+Vamos agora importar o dataset de casamentos_nascimentosbr_2017 para incrementar nossa base de dados atual, e ver o quanto nosso modelo acerta para o ano de 2017!	
+
+```{r,echo=TRUE}
+
+casamentos_nascimentosbr_2017<-read_xlsx("C:\\Users\\lferreira\\Downloads\\live university\\casamentos_nascimentosbr_2017.xlsx")
+
+casamentos_nascimentosbr_2017<- casamentos_nascimentosbr_2017%>%
+  mutate(
+    estado = as.factor(estado),
+    classe = factor(classe,levels = c( "15 a 19 anos","20 a 24 anos","25 a 29 anos","30 a 34 anos",
+   "35 a 39 anos","40 a 44 anos","Menos de 15 anos","45 a 49 anos","50 anos ou mais"
+ )),
+    ano = as.integer(ano)  
+  )
+
+casamentos_nascimentosbr_ml2<-bind_rows(casamentos_nascimentosbr_ml,casamentos_nascimentosbr_2017)
+
+casamentos_nascimentosbr_ml2_nest<-casamentos_nascimentosbr_ml2%>%
+  group_by(estado)%>%nest()
+
+casamentos_nascimentosbr_ml2_nest<-casamentos_nascimentosbr_ml2_nest%>%
+  mutate(train = map(.x=data,.f=~.x%>%
+        filter(ano<2017)),
+        validate = map(.x=data,.f=~.x%>%
+        filter(ano>=2017))
+                     )
+
+casamentos_nascimentosbr_ml2_nest<-casamentos_nascimentosbr_ml2_nest%>%
+  mutate( model = map(.x=train,.f=~ranger(formula=qtd_nascimentos~.,data= .x,
+                                               num.trees=100,seed = 42,mtry = 3)))
+
+casamentos_nascimentosbr_ml2_nest<-casamentos_nascimentosbr_ml2_nest%>%
+  mutate( validate_predicted = map2(.x = model, .y = validate, ~predict(.x, .y)$predictions),
+      validate_actual = map(.x=validate,.f= ~.x$qtd_nascimentos))
+
+casamentos_nascimentosbr_ml2_nest<-casamentos_nascimentosbr_ml2_nest%>%
+    mutate(validate_smape = map2_dbl(.x=validate_actual,
+                                    .y=validate_predicted, .f= ~smape(actual = .x, predicted = .y)))
+
+casamentos_nascimentosbr_ml2_result<-casamentos_nascimentosbr_ml2_nest[,c(1,8)]
+
+ casamentos_nascimentosbr_ml2_result%>%
+  kable()
+
+analise_2017<-casamentos_nascimentosbr_ml2_nest[,c(1,6,7)]%>%
+  unnest(validate_actual,validate_predicted)%>%
+  group_by(estado)%>%
+  summarise(Real = sum(validate_actual),Previsto = sum(validate_predicted))%>%
+  gather(Tipo,Valor,2:3)
+
+  ggplot(analise_2017,aes(x=estado,y=Valor,fill=Tipo))+
+  geom_col(position = "dodge")+
+  labs(x="Estado",y="Qtd_Nascimentos",title = "Real x Previsto 2017",subtitle= "Usando o
+       modelo de Random Forest, mtry = 3, num.trees = 100",
+       caption = "Fonte: IBGE - Estatísticas do Registro Civil (2003-2016)")+
+    scale_y_continuous(label=scales::comma)+
+  coord_flip()
+  
+  casamentos_nascimentosbr_ml2_nest[,c(1,6,7)]%>%
+  unnest(validate_actual,validate_predicted)%>%
+  group_by(estado)%>%
+  summarise(Real = sum(validate_actual),Previsto = sum(validate_predicted))%>%
+    kable()
+  
+```
+
+Bem próximo da realidade não acha?
+
+Chegamos ao fim! Não criamos o melhor modelo do mundo, mas foi bastante eficiente! 
+
+Acredito que possamos explorar mais esses dados na busca de variáveis que ajudam a explicar melhor a quantidade de nascimentos, principalmente para classes fora do arco 15-44 anos.
+
+Mas foi bacana não é?
+
+Obrigado por ter tido paciência para chegar até aqui! Foi uma longa jornada!
+
+Abraços! Sucesso e até a próxima!
